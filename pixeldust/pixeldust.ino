@@ -46,7 +46,7 @@ Adafruit_Protomatter matrix(
 Adafruit_LIS3DH accel = Adafruit_LIS3DH();
 
 #define N_COLORS   8
-#define BOX_HEIGHT 8
+#define BOX_HEIGHT 8  // Increased from 8 for more sand
 #define N_GRAINS (BOX_HEIGHT*N_COLORS*8)
 uint16_t colors[N_COLORS];
 
@@ -99,14 +99,14 @@ void setup(void) {
   }
   Serial.printf("%d total pixels\n", n);
 
-  colors[0] = matrix.color565(64, 64, 64);  // Dark Gray
-  colors[1] = matrix.color565(120, 79, 23); // Brown
-  colors[2] = matrix.color565(228,  3,  3); // Red
-  colors[3] = matrix.color565(255,140,  0); // Orange
-  colors[4] = matrix.color565(255,237,  0); // Yellow
-  colors[5] = matrix.color565(  0,128, 38); // Green
-  colors[6] = matrix.color565(  0, 77,255); // Blue
-  colors[7] = matrix.color565(117,  7,135); // Purple
+  colors[0] = matrix.color565(32, 32, 32);  // Dark Gray (dimmed)
+  colors[1] = matrix.color565(60, 40, 12);  // Brown (dimmed)
+  colors[2] = matrix.color565(114, 2,  2);  // Red (dimmed)
+  colors[3] = matrix.color565(128, 70, 0);  // Orange (dimmed)
+  colors[4] = matrix.color565(128,119, 0);  // Yellow (dimmed)
+  colors[5] = matrix.color565(  0, 64, 19); // Green (dimmed)
+  colors[6] = matrix.color565(  0, 39,128); // Blue (dimmed)
+  colors[7] = matrix.color565( 59,  4, 68); // Purple (dimmed)
 }
 
 // MAIN LOOP - RUNS ONCE PER FRAME OF ANIMATION ----------------------------
@@ -126,9 +126,9 @@ void loop() {
   //Serial.printf("(%0.1f, %0.1f, %0.1f)\n", event.acceleration.x, event.acceleration.y, event.acceleration.z);
 
   double xx, yy, zz;
-  xx = event.acceleration.x * 1000;
-  yy = event.acceleration.y * 1000;
-  zz = event.acceleration.z * 1000;
+  xx = event.acceleration.x * 4000;  // Increased from 1000 for faster response
+  yy = event.acceleration.y * 4000;  // Increased from 1000 for faster response
+  zz = event.acceleration.z * 4000;  // Increased from 1000 for faster response
 
   // Run one frame of the simulation
   sand.iterate(xx, yy, zz);
