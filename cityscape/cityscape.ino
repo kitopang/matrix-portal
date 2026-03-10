@@ -102,9 +102,14 @@ uint16_t COL_BUILDING_DAY;  // day: lighter grey
 uint16_t COL_MOON;
 
 // ----- Stars ------------------------------------------------------------
-#define NUM_STARS 38
-#define CLOCK_X2  31   // clock occupies x=1..30, y=1..8
-#define CLOCK_Y2   9
+// Grid: 8 cols × 5 rows = 40 cells — one star per cell for even coverage.
+// SKY_MAX_Y: 5px above the tallest building (min buildingTop = 43).
+#define NUM_STARS   40
+#define STAR_COLS    8
+#define STAR_ROWS    5
+#define SKY_MAX_Y   40   // stars kept in y = 0..40 (2px above tallest building at y=43)
+#define CLOCK_X2    31   // clock occupies x=1..30, y=1..8
+#define CLOCK_Y2     9
 uint8_t starX[NUM_STARS];
 uint8_t starY[NUM_STARS];
 uint8_t starBright[NUM_STARS];
@@ -236,18 +241,30 @@ void setup() {
   winColors[0] = matrix.color565(220, 180,  60);
   winColors[1] = matrix.color565(200, 120,  30);
 
-  for (int i = 0; i < NUM_STARS; i++) {
-    uint8_t sx, sy;
-    do {
-      sx = random(WIDTH);
-      sy = random(41);
-    } while (sx <= CLOCK_X2 && sy <= CLOCK_Y2);
-    starX[i]      = sx;
-    starY[i]      = sy;
-    starPeak[i]   = random(100, 256);
-    starBright[i] = random(10, starPeak[i] + 1);
-    starTarget[i] = random(10, starPeak[i] + 1);
-    starSpeed[i]  = random(2, 7);
+  // Place one star per grid cell, jittered within the cell.
+  // Cells that fully overlap the clock zone get nudged to the cell's far corner.
+  {
+    int cellW = WIDTH   / STAR_COLS;          // 8 px wide
+    int cellH = (SKY_MAX_Y + 1) / STAR_ROWS; // ~7 px tall
+    int idx   = 0;
+    for (int row = 0; row < STAR_ROWS && idx < NUM_STARS; row++) {
+      for (int col = 0; col < STAR_COLS && idx < NUM_STARS; col++) {
+        uint8_t sx, sy;
+        int tries = 0;
+        do {
+          sx = col * cellW + random(cellW);
+          sy = row * cellH + random(cellH);
+          tries++;
+        } while (sx <= CLOCK_X2 && sy <= CLOCK_Y2 && tries < 10);
+        starX[idx]      = sx;
+        starY[idx]      = sy;
+        starPeak[idx]   = random(100, 256);
+        starBright[idx] = random(10, starPeak[idx] + 1);
+        starTarget[idx] = random(10, starPeak[idx] + 1);
+        starSpeed[idx]  = random(1, 3);
+        idx++;
+      }
+    }
   }
 
   int wIdx = 0, attempts = 0;
