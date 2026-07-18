@@ -4,7 +4,7 @@
 
    Features:
      - Manhattan skyline silhouette
-     - Day mode: sun with rays, birds flying across the scene
+     - Day mode: sky icon reflects current weather (sun/cloud/rain/snow/storm), birds fly when clear
      - Night mode: twinkling stars, crescent moon, lit building windows
      - Auto mode: switches at actual sunrise/sunset via Open-Meteo API
      - 24-hour digital clock (top-left, via WiFi/NTP)
@@ -31,6 +31,11 @@
 enum DisplayMode { MODE_AUTO, MODE_DAY, MODE_NIGHT };
 DisplayMode displayMode = MODE_AUTO;
 
+// Weather condition for the day-mode sky icon (moved up near DisplayMode so the
+// Arduino IDE's auto-generated function prototypes, inserted near the top of the
+// file, see this type before they reference it).
+enum WeatherCond { WX_CLEAR, WX_CLOUDY, WX_RAIN, WX_SNOW, WX_STORM };
+
 #define BUTTON_UP 6   // MatrixPortal S3 UP button (active LOW)
 
 // ── Sunrise/sunset (Open-Meteo, Manhattan) ───────────────────────────────────
@@ -39,6 +44,7 @@ DisplayMode displayMode = MODE_AUTO;
 int sunriseMin = 6 * 60;   // fallback: 6:00 AM
 int sunsetMin  = 18 * 60;  // fallback: 6:00 PM
 float currentTempF = NAN;  // current temperature, updated periodically
+int   currentWeatherCode = 0;  // WMO weather code, updated periodically (0 = clear)
 #define WEATHER_REFRESH_MS (10UL * 60UL * 1000UL)  // 10 minutes
 uint32_t lastWeatherFetchMs = 0;
 
@@ -172,6 +178,32 @@ static bool parseTemperature(const String &json, float &outTemp) {
   return true;
 }
 
+static bool parseWeatherCode(const String &json, int &outCode) {
+  // Same "current" object as temperature_2m — see note above about current_units.
+  int curIdx = json.indexOf("\"current\":{");
+  if (curIdx < 0) return false;
+  String needle = "\"weather_code\":";
+  int idx = json.indexOf(needle, curIdx);
+  if (idx < 0) return false;
+  idx += needle.length();
+  int endIdx = idx;
+  while (endIdx < (int)json.length() && isDigit(json[endIdx]))
+    endIdx++;
+  if (endIdx == idx) return false;
+  outCode = json.substring(idx, endIdx).toInt();
+  return true;
+}
+
+// WMO weather codes: https://open-meteo.com/en/docs
+WeatherCond classifyWeather(int code) {
+  if (code == 95 || code == 96 || code == 99) return WX_STORM;
+  if (code == 71 || code == 73 || code == 75 || code == 77 ||
+      code == 85 || code == 86) return WX_SNOW;
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return WX_RAIN;
+  if (code == 2 || code == 3 || code == 45 || code == 48) return WX_CLOUDY;
+  return WX_CLEAR;  // 0, 1, or unrecognized
+}
+
 void fetchSunTimes() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
@@ -180,7 +212,7 @@ void fetchSunTimes() {
     "?latitude=" WEATHER_LAT
     "&longitude=" WEATHER_LON
     "&daily=sunrise,sunset"
-    "&current=temperature_2m"
+    "&current=temperature_2m,weather_code"
     "&temperature_unit=fahrenheit"
     "&timezone=America%2FNew_York"
     "&forecast_days=1";
@@ -202,6 +234,13 @@ void fetchSunTimes() {
       Serial.printf("Temperature: %.1f F\n", temp);
     } else {
       Serial.println("Temperature: parse failed.");
+    }
+    int code;
+    if (parseWeatherCode(body, code)) {
+      currentWeatherCode = code;
+      Serial.printf("Weather code: %d\n", code);
+    } else {
+      Serial.println("Weather code: parse failed.");
     }
   }
   http.end();
@@ -232,6 +271,47 @@ void drawSun(int cx, int cy) {
   const int8_t dy[] = {-7, -8,  7,  8,  0,  0,  0,  0, -5, -5,  5,  5, -6,  6, -6,  6};
   for (int i = 0; i < 16; i++)
     matrix.drawPixel(cx + dx[i], cy + dy[i], ray);
+}
+
+void drawCloud(int cx, int cy, uint16_t color) {
+  // Irregular bumps on top, all sized/placed so none dip below the base's
+  // bottom row (cy+3) — that row stays a clean flat line.
+  matrix.fillCircle(cx - 5, cy + 1, 2, color);
+  matrix.fillCircle(cx - 2, cy - 1, 3, color);
+  matrix.fillCircle(cx + 1, cy - 2, 3, color);
+  matrix.fillCircle(cx + 4, cy,     2, color);
+  matrix.fillCircle(cx + 6, cy + 1, 1, color);
+  matrix.fillRoundRect(cx - 7, cy, 15, 4, 1, color);  // flat base, rounded corners
+}
+
+void drawRain(int cx, int cy) {
+  drawCloud(cx, cy, matrix.color565(110, 110, 122));
+  uint16_t dropColor = matrix.color565(90, 160, 255);
+  const int8_t dropX[] = { -5, -1, 3, 6 };
+  for (int i = 0; i < 4; i++) {
+    int y = cy + 5 + ((frameCount / 2 + i * 3) % 8);
+    matrix.drawPixel(cx + dropX[i], y, dropColor);
+  }
+}
+
+void drawSnow(int cx, int cy) {
+  drawCloud(cx, cy, matrix.color565(170, 172, 180));
+  uint16_t flakeColor = matrix.color565(230, 235, 245);
+  const int8_t flakeX[] = { -5, -1, 3, 6 };
+  for (int i = 0; i < 4; i++) {
+    int y = cy + 5 + ((frameCount / 6 + i * 3) % 8);
+    int x = cx + flakeX[i] + (((frameCount / 6 + i) % 4 < 2) ? 0 : 1);
+    matrix.drawPixel(x, y, flakeColor);
+  }
+}
+
+void drawStorm(int cx, int cy) {
+  drawCloud(cx, cy, matrix.color565(75, 75, 85));
+  if ((frameCount % 90) < 4) {
+    uint16_t boltColor = matrix.color565(255, 255, 180);
+    matrix.drawLine(cx - 1, cy + 4, cx + 1, cy + 7,  boltColor);
+    matrix.drawLine(cx + 1, cy + 7, cx - 1, cy + 10, boltColor);
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -361,29 +441,38 @@ void loop() {
 
   // ── Day scene ─────────────────────────────────────────────────────────
   if (dayMode) {
-    drawSun(52, 8);
+    WeatherCond wx = classifyWeather(currentWeatherCode);
+    switch (wx) {
+      case WX_CLOUDY: drawCloud(52, 8, matrix.color565(190, 192, 200)); break;
+      case WX_RAIN:   drawRain(52, 8);  break;
+      case WX_SNOW:   drawSnow(52, 8);  break;
+      case WX_STORM:  drawStorm(52, 8); break;
+      default:        drawSun(52, 8);   break;  // WX_CLEAR
+    }
 
-    // Birds: update position and draw (same color as day buildings)
-    uint16_t birdCol = COL_BUILDING_DAY;
-    for (int i = 0; i < NUM_BIRDS; i++) {
-      int x = (int)birdX[i];
-      int y = (int)birdY[i];
+    // Birds: only fly in clear/cloudy weather; update position and draw
+    if (wx == WX_CLEAR || wx == WX_CLOUDY) {
+      uint16_t birdCol = COL_BUILDING_DAY;
+      for (int i = 0; i < NUM_BIRDS; i++) {
+        int x = (int)birdX[i];
+        int y = (int)birdY[i];
 
-      // Alternate wings up/down based on per-bird flap rate
-      bool wingsUp = ((frameCount / birdFlapRate[i]) % 2 == 0);
-      int wy = wingsUp ? y - 1 : y + 1;
+        // Alternate wings up/down based on per-bird flap rate
+        bool wingsUp = ((frameCount / birdFlapRate[i]) % 2 == 0);
+        int wy = wingsUp ? y - 1 : y + 1;
 
-      if (x >= 2 && x <= WIDTH - 3) {
-        matrix.drawPixel(x - 2, wy, birdCol);  // left wing tip
-        matrix.drawPixel(x,     y,  birdCol);  // body
-        matrix.drawPixel(x + 2, wy, birdCol);  // right wing tip
-      }
+        if (x >= 2 && x <= WIDTH - 3) {
+          matrix.drawPixel(x - 2, wy, birdCol);  // left wing tip
+          matrix.drawPixel(x,     y,  birdCol);  // body
+          matrix.drawPixel(x + 2, wy, birdCol);  // right wing tip
+        }
 
-      // Advance; wrap to left edge with a fresh random height
-      birdX[i] += birdSpeedX[i];
-      if (birdX[i] > WIDTH + 3) {
-        birdX[i] = -3;
-        birdY[i] = random(CLOCK_Y2 + 3, 40);
+        // Advance; wrap to left edge with a fresh random height
+        birdX[i] += birdSpeedX[i];
+        if (birdX[i] > WIDTH + 3) {
+          birdX[i] = -3;
+          birdY[i] = random(CLOCK_Y2 + 3, 40);
+        }
       }
     }
 
