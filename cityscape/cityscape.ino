@@ -17,6 +17,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <time.h>
+#include <math.h>
 
 // ── WiFi / NTP ──────────────────────────────────────────────────────────────
 #define WIFI_SSID  "MyOptimum 962dc1"
@@ -37,6 +38,9 @@ DisplayMode displayMode = MODE_AUTO;
 #define WEATHER_LON "-74.0060"
 int sunriseMin = 6 * 60;   // fallback: 6:00 AM
 int sunsetMin  = 18 * 60;  // fallback: 6:00 PM
+float currentTempF = NAN;  // current temperature, updated periodically
+#define WEATHER_REFRESH_MS (10UL * 60UL * 1000UL)  // 10 minutes
+uint32_t lastWeatherFetchMs = 0;
 
 #define HEIGHT   64
 #define WIDTH    64
@@ -108,8 +112,8 @@ uint16_t COL_MOON;
 #define STAR_COLS    8
 #define STAR_ROWS    5
 #define SKY_MAX_Y   40   // stars kept in y = 0..40 (2px above tallest building at y=43)
-#define CLOCK_X2    31   // clock occupies x=1..30, y=1..8
-#define CLOCK_Y2     9
+#define CLOCK_X2    35   // clock+temp block occupies x=3..34, y=3..19
+#define CLOCK_Y2    20
 uint8_t starX[NUM_STARS];
 uint8_t starY[NUM_STARS];
 uint8_t starBright[NUM_STARS];
@@ -151,6 +155,23 @@ static bool parseSunField(const String &json, const char *key, int &outMin) {
   return true;
 }
 
+static bool parseTemperature(const String &json, float &outTemp) {
+  // Skip past "current_units", which also has a (string-valued) temperature_2m key.
+  int curIdx = json.indexOf("\"current\":{");
+  if (curIdx < 0) return false;
+  String needle = "\"temperature_2m\":";
+  int idx = json.indexOf(needle, curIdx);
+  if (idx < 0) return false;
+  idx += needle.length();
+  int endIdx = idx;
+  while (endIdx < (int)json.length() &&
+         (isDigit(json[endIdx]) || json[endIdx] == '.' || json[endIdx] == '-'))
+    endIdx++;
+  if (endIdx == idx) return false;
+  outTemp = json.substring(idx, endIdx).toFloat();
+  return true;
+}
+
 void fetchSunTimes() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
@@ -159,6 +180,8 @@ void fetchSunTimes() {
     "?latitude=" WEATHER_LAT
     "&longitude=" WEATHER_LON
     "&daily=sunrise,sunset"
+    "&current=temperature_2m"
+    "&temperature_unit=fahrenheit"
     "&timezone=America%2FNew_York"
     "&forecast_days=1";
   http.begin(url);
@@ -173,8 +196,16 @@ void fetchSunTimes() {
     } else {
       Serial.println("Sun times: parse failed, using defaults.");
     }
+    float temp;
+    if (parseTemperature(body, temp)) {
+      currentTempF = temp;
+      Serial.printf("Temperature: %.1f F\n", temp);
+    } else {
+      Serial.println("Temperature: parse failed.");
+    }
   }
   http.end();
+  lastWeatherFetchMs = millis();
 }
 
 bool isDaytime() {
@@ -182,6 +213,14 @@ bool isDaytime() {
   if (!getLocalTime(&t, 0)) return false;
   int nowMin = t.tm_hour * 60 + t.tm_min;
   return nowMin >= sunriseMin && nowMin < sunsetMin;
+}
+
+uint16_t tempColorF(float f) {
+  if      (f < 32) return matrix.color565(120, 160, 255);  // freezing: blue
+  else if (f < 50) return matrix.color565(120, 220, 255);  // cold: cyan
+  else if (f < 70) return matrix.color565(130, 255, 140);  // mild: green
+  else if (f < 85) return matrix.color565(255, 210,  80);  // warm: yellow
+  else             return matrix.color565(255,  90,  60);  // hot: red
 }
 
 void drawSun(int cx, int cy) {
@@ -307,6 +346,10 @@ void loop() {
       displayMode == MODE_AUTO ? "AUTO" : displayMode == MODE_DAY ? "DAY" : "NIGHT");
   }
 
+  // ── Periodic weather refresh (sun times + temperature) ────────────────
+  if (millis() - lastWeatherFetchMs > WEATHER_REFRESH_MS)
+    fetchSunTimes();
+
   // ── Resolve day/night ─────────────────────────────────────────────────
   bool dayMode;
   if      (displayMode == MODE_DAY)   dayMode = true;
@@ -392,8 +435,23 @@ void loop() {
     if (getLocalTime(&timeinfo, 0))
       snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     matrix.setTextColor(matrix.color565(220, 180, 60));
-    matrix.setCursor(1, 1);
+    matrix.setCursor(3, 3);
     matrix.print(timeBuf);
+  }
+
+  // Temperature (below clock, left-aligned) — degree symbol drawn as a 2x2 square
+  {
+    char tempBuf[4];
+    if (isnan(currentTempF))
+      strcpy(tempBuf, "--");
+    else
+      snprintf(tempBuf, sizeof(tempBuf), "%d", (int)lroundf(currentTempF));
+    uint16_t tempColor = isnan(currentTempF) ? matrix.color565(140, 200, 255)
+                                              : tempColorF(currentTempF);
+    matrix.setTextColor(tempColor);
+    matrix.setCursor(3, 12);
+    matrix.print(tempBuf);
+    matrix.fillRect(matrix.getCursorX(), 12, 2, 2, tempColor);
   }
 
   // Mode label (A / D / N) shown for 3 s after button press
@@ -401,7 +459,7 @@ void loop() {
     const char *label = (displayMode == MODE_AUTO) ? "A"
                       : (displayMode == MODE_DAY)  ? "D" : "N";
     matrix.setTextColor(matrix.color565(100, 200, 255));
-    matrix.setCursor(1, 10);
+    matrix.setCursor(58, 3);
     matrix.print(label);
   }
 
