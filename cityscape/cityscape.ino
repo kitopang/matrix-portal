@@ -6,12 +6,14 @@
      - Manhattan skyline silhouette
      - Day mode: sky icon reflects current weather (sun/cloud/rain/snow/storm), birds fly when clear
      - Night mode: twinkling stars, crescent moon, lit building windows
+     - Twilight mode: night-mode buildings, no stars, low setting-sun icon —
+       used automatically for the 30 min around real sunrise/sunset in auto mode
      - Auto mode: switches at actual sunrise/sunset via Open-Meteo API
      - 24-hour digital clock (top-left, via WiFi/NTP)
      - Temperature and minutes-to-next-M-train (Central Av, Manhattan-bound) below the clock
      - UP button cycles modes; active mode shown briefly below clock
 
-   DISPLAY_MODE options:  MODE_AUTO | MODE_DAY | MODE_NIGHT
+   DISPLAY_MODE options:  MODE_AUTO | MODE_DAY | MODE_NIGHT | MODE_TWILIGHT
    ----------------------------------------------------------------------- */
 
 #include <Adafruit_Protomatter.h>
@@ -27,15 +29,21 @@
 #define TZ_STRING  "EST5EDT,M3.2.0,M11.1.0"  // US Eastern (handles DST)
 
 // ── Display mode ─────────────────────────────────────────────────────────────
-// UP button (pin 6) cycles:  AUTO → DAY → NIGHT → AUTO …
+// UP button (pin 6) cycles:  AUTO → DAY → NIGHT → TWILIGHT → AUTO …
+// TWILIGHT is a manual-only mode for previewing the dawn/dusk look; AUTO
+// switches into it on its own near real sunrise/sunset (see resolvePhase()).
 // Change the initial value here to start in a different mode.
-enum DisplayMode { MODE_AUTO, MODE_DAY, MODE_NIGHT };
+enum DisplayMode { MODE_AUTO, MODE_DAY, MODE_NIGHT, MODE_TWILIGHT };
 DisplayMode displayMode = MODE_AUTO;
 
 // Weather condition for the day-mode sky icon (moved up near DisplayMode so the
 // Arduino IDE's auto-generated function prototypes, inserted near the top of the
 // file, see this type before they reference it).
 enum WeatherCond { WX_CLEAR, WX_CLOUDY, WX_RAIN, WX_SNOW, WX_STORM };
+
+// Time-of-day phase for AUTO mode: dawn/dusk (TWILIGHT) gets night-mode
+// buildings with no stars and a low setting-sun icon (see resolvePhase()).
+enum DayPhase { PHASE_NIGHT, PHASE_TWILIGHT, PHASE_DAY };
 
 // Minimal protobuf byte-buffer view (moved up near the other early type
 // declarations for the same reason as WeatherCond above — Arduino's
@@ -138,8 +146,10 @@ uint16_t COL_MOON;
 #define STAR_COLS    8
 #define STAR_ROWS    5
 #define SKY_MAX_Y   40   // stars kept in y = 0..40 (2px above tallest building at y=43)
-#define CLOCK_X2    35   // clock/temp/train block occupies x=3..34, y=3..28
-#define CLOCK_Y2    29
+// Clock/temp/train text block, banded per row (each row is a different
+// width) rather than one bounding rectangle, so stars can fill the sky
+// space next to a narrow row instead of being excluded by the widest one.
+#define CLOCK_Y2    29   // bottom of the whole text block (used for bird spawn Y)
 uint8_t starX[NUM_STARS];
 uint8_t starY[NUM_STARS];
 uint8_t starBright[NUM_STARS];
@@ -444,11 +454,20 @@ void fetchNextTrain() {
   http.end();
 }
 
-bool isDaytime() {
+#define TWILIGHT_MINS 30  // dawn/dusk window length, each side of sunrise/sunset
+
+// AUTO-mode time-of-day phase: night → twilight (30 min after sunrise, and the
+// 30 min before sunset) → day → twilight → night.
+DayPhase resolvePhase() {
   struct tm t;
-  if (!getLocalTime(&t, 0)) return false;
+  if (!getLocalTime(&t, 0)) return PHASE_NIGHT;
   int nowMin = t.tm_hour * 60 + t.tm_min;
-  return nowMin >= sunriseMin && nowMin < sunsetMin;
+  int dawnEnd   = sunriseMin + TWILIGHT_MINS;
+  int duskStart = sunsetMin  - TWILIGHT_MINS;
+  if (nowMin >= sunriseMin && nowMin < dawnEnd)   return PHASE_TWILIGHT;
+  if (nowMin >= duskStart  && nowMin < sunsetMin) return PHASE_TWILIGHT;
+  if (nowMin >= dawnEnd    && nowMin < duskStart) return PHASE_DAY;
+  return PHASE_NIGHT;
 }
 
 uint16_t tempColorF(float f) {
@@ -457,6 +476,16 @@ uint16_t tempColorF(float f) {
   else if (f < 75) return matrix.color565(255, 220,  60);  // yellow
   else if (f < 85) return matrix.color565(255, 140,  30);  // orange
   else             return matrix.color565(255,  60,  40);  // red
+}
+
+// Is (x,y) inside the clock/temp/train text block? Banded per row instead of
+// one rectangle, since the clock ("HH:MM") is much wider than the temp/train
+// rows below it.
+bool inTextZone(uint8_t x, uint8_t y) {
+  if (y <= 11) return x <= 34;  // clock row
+  if (y <= 20) return x <= 20;  // temperature row
+  if (y <= 29) return x <= 17;  // train countdown row
+  return false;
 }
 
 uint16_t trainColorMins(int mins) {
@@ -474,6 +503,20 @@ void drawSun(int cx, int cy) {
   const int8_t dy[] = {-7, -8,  7,  8,  0,  0,  0,  0, -5, -5,  5,  5, -6,  6, -6,  6};
   for (int i = 0; i < 16; i++)
     matrix.drawPixel(cx + dx[i], cy + dy[i], ray);
+}
+
+// Low sun peeking over a horizon line — used for the dawn/dusk twilight icon.
+void drawTwilightSun(int cx, int cy) {
+  uint16_t core = matrix.color565(255, 130,  40);
+  uint16_t glow = matrix.color565(255,  80,  30);
+  matrix.fillCircle(cx, cy, 4, core);
+  matrix.fillRect(cx - 5, cy + 1, 11, 5, 0);        // clip the lower half away
+  matrix.drawFastHLine(cx - 6, cy + 1, 13, glow);   // horizon line
+
+  // Reflection: 2 horizontal lines below the horizon (3 lines total with the
+  // horizon), 2 rows apart.
+  matrix.drawFastHLine(cx - 3, cy + 3, 7, glow);
+  matrix.drawFastHLine(cx - 1, cy + 5, 3, glow);
 }
 
 void drawCloud(int cx, int cy, uint16_t color) {
@@ -564,7 +607,7 @@ void setup() {
   winColors[1] = matrix.color565(200, 120,  30);
 
   // Place one star per grid cell, jittered within the cell.
-  // Cells that fully overlap the clock zone get nudged to the cell's far corner.
+  // Cells that fully overlap the text zone get relocated outside it entirely.
   {
     int cellW = WIDTH   / STAR_COLS;          // 8 px wide
     int cellH = (SKY_MAX_Y + 1) / STAR_ROWS; // ~7 px tall
@@ -577,12 +620,11 @@ void setup() {
           sx = col * cellW + random(cellW);
           sy = row * cellH + random(cellH);
           tries++;
-        } while (sx <= CLOCK_X2 && sy <= CLOCK_Y2 && tries < 10);
-        // Cells fully inside the clock/temp/train block have no valid spot at
-        // all, so the retries above can never escape it — fall back to a
-        // random spot anywhere outside the block instead of leaving the star
-        // sitting on top of the text.
-        while (sx <= CLOCK_X2 && sy <= CLOCK_Y2) {
+        } while (inTextZone(sx, sy) && tries < 10);
+        // Cells fully inside the text zone have no valid spot at all, so the
+        // retries above can never escape it — fall back to a random spot
+        // anywhere outside the zone instead of leaving the star on the text.
+        while (inTextZone(sx, sy)) {
           sx = random(WIDTH);
           sy = random(SKY_MAX_Y + 1);
         }
@@ -632,10 +674,11 @@ void loop() {
   // ── Button: cycle mode (debounced 250 ms) ─────────────────────────────
   if (digitalRead(BUTTON_UP) == LOW && (millis() - lastBtnMs) > 250) {
     lastBtnMs = millis();
-    displayMode   = (DisplayMode)((displayMode + 1) % 3);
+    displayMode   = (DisplayMode)((displayMode + 1) % 4);
     modeShowUntil = millis() + 3000;  // show label for 3 s
     Serial.printf("Mode: %s\n",
-      displayMode == MODE_AUTO ? "AUTO" : displayMode == MODE_DAY ? "DAY" : "NIGHT");
+      displayMode == MODE_AUTO ? "AUTO" : displayMode == MODE_DAY ? "DAY"
+      : displayMode == MODE_NIGHT ? "NIGHT" : "TWILIGHT");
   }
 
   // ── Periodic weather refresh (sun times + temperature) ────────────────
@@ -646,17 +689,18 @@ void loop() {
   if (millis() - lastTrainFetchMs > TRAIN_REFRESH_MS)
     fetchNextTrain();
 
-  // ── Resolve day/night ─────────────────────────────────────────────────
-  bool dayMode;
-  if      (displayMode == MODE_DAY)   dayMode = true;
-  else if (displayMode == MODE_NIGHT) dayMode = false;
-  else                                dayMode = isDaytime();
+  // ── Resolve day/twilight/night ──────────────────────────────────────────
+  DayPhase phase;
+  if      (displayMode == MODE_DAY)      phase = PHASE_DAY;
+  else if (displayMode == MODE_NIGHT)    phase = PHASE_NIGHT;
+  else if (displayMode == MODE_TWILIGHT) phase = PHASE_TWILIGHT;
+  else                                    phase = resolvePhase();  // AUTO
 
   // ── Sky background ────────────────────────────────────────────────────
-  matrix.fillScreen(0);  // black in both modes
+  matrix.fillScreen(0);  // black in all modes
 
   // ── Day scene ─────────────────────────────────────────────────────────
-  if (dayMode) {
+  if (phase == PHASE_DAY) {
     WeatherCond wx = classifyWeather(currentWeatherCode);
     switch (wx) {
       case WX_CLOUDY: drawCloud(52, 8, matrix.color565(190, 192, 200)); break;
@@ -692,6 +736,10 @@ void loop() {
       }
     }
 
+  // ── Twilight scene (dawn/dusk): night-mode buildings, no stars ─────────
+  } else if (phase == PHASE_TWILIGHT) {
+    drawTwilightSun(52, 8);
+
   // ── Night scene ───────────────────────────────────────────────────────
   } else {
     // Stars: smooth twinkle
@@ -713,12 +761,12 @@ void loop() {
   }
 
   // ── Building silhouette (always) ──────────────────────────────────────
-  uint16_t bldColor = dayMode ? COL_BUILDING_DAY : COL_BUILDING;
+  uint16_t bldColor = (phase == PHASE_DAY) ? COL_BUILDING_DAY : COL_BUILDING;
   for (int x = 0; x < WIDTH; x++)
     matrix.drawFastVLine(x, buildingTop[x], GROUND_Y - buildingTop[x] + 1, bldColor);
 
   // ── Lit windows — drawn after buildings so they appear on top ──────────
-  if (!dayMode) {
+  if (phase != PHASE_DAY) {
     for (int i = 0; i < NUM_WINDOWS; i++) {
       if (winLit[i])
         matrix.drawPixel(winX[i], winY[i], winColors[winY[i] & 1]);
@@ -776,10 +824,11 @@ void loop() {
     matrix.print(trainBuf);
   }
 
-  // Mode label (A / D / N) shown for 3 s after button press
+  // Mode label (A / D / N / T) shown for 3 s after button press
   if (millis() < modeShowUntil) {
-    const char *label = (displayMode == MODE_AUTO) ? "A"
-                      : (displayMode == MODE_DAY)  ? "D" : "N";
+    const char *label = (displayMode == MODE_AUTO)  ? "A"
+                      : (displayMode == MODE_DAY)    ? "D"
+                      : (displayMode == MODE_NIGHT)  ? "N" : "T";
     matrix.setTextColor(matrix.color565(100, 200, 255));
     matrix.setCursor(58, 3);
     matrix.print(label);
