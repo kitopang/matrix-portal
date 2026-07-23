@@ -8,6 +8,7 @@
      - Night mode: twinkling stars, crescent moon, lit building windows
      - Auto mode: switches at actual sunrise/sunset via Open-Meteo API
      - 24-hour digital clock (top-left, via WiFi/NTP)
+     - Temperature and minutes-to-next-M-train (Central Av, Manhattan-bound) below the clock
      - UP button cycles modes; active mode shown briefly below clock
 
    DISPLAY_MODE options:  MODE_AUTO | MODE_DAY | MODE_NIGHT
@@ -36,6 +37,15 @@ DisplayMode displayMode = MODE_AUTO;
 // file, see this type before they reference it).
 enum WeatherCond { WX_CLEAR, WX_CLOUDY, WX_RAIN, WX_SNOW, WX_STORM };
 
+// Minimal protobuf byte-buffer view (moved up near the other early type
+// declarations for the same reason as WeatherCond above — Arduino's
+// auto-generated prototypes need this type defined before they run).
+struct PBBuf {
+  const uint8_t *data;
+  size_t len;
+  size_t pos;
+};
+
 #define BUTTON_UP 6   // MatrixPortal S3 UP button (active LOW)
 
 // ── Sunrise/sunset (Open-Meteo, Manhattan) ───────────────────────────────────
@@ -47,6 +57,16 @@ float currentTempF = NAN;  // current temperature, updated periodically
 int   currentWeatherCode = 0;  // WMO weather code, updated periodically (0 = clear)
 #define WEATHER_REFRESH_MS (10UL * 60UL * 1000UL)  // 10 minutes
 uint32_t lastWeatherFetchMs = 0;
+
+// ── Next M train, Manhattan-bound (Central Av, MTA GTFS-realtime) ───────────
+// Stop M10 = Central Av on the Myrtle Av line; "N" = the Manhattan-bound
+// direction (MTA's North Direction Label for this stop is "Manhattan").
+#define MTA_FEED_URL "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm"
+#define MTA_STOP_ID  "M10N"
+#define MTA_ROUTE_ID "M"
+#define TRAIN_REFRESH_MS (60UL * 1000UL)  // 1 minute — MTA feed is HTTPS-only, see fetchNextTrain()
+int64_t  nextTrainEpoch  = -1;  // unix time of next arrival, -1 = unknown
+uint32_t lastTrainFetchMs = 0;
 
 #define HEIGHT   64
 #define WIDTH    64
@@ -118,8 +138,8 @@ uint16_t COL_MOON;
 #define STAR_COLS    8
 #define STAR_ROWS    5
 #define SKY_MAX_Y   40   // stars kept in y = 0..40 (2px above tallest building at y=43)
-#define CLOCK_X2    35   // clock+temp block occupies x=3..34, y=3..19
-#define CLOCK_Y2    20
+#define CLOCK_X2    35   // clock/temp/train block occupies x=3..34, y=3..28
+#define CLOCK_Y2    29
 uint8_t starX[NUM_STARS];
 uint8_t starY[NUM_STARS];
 uint8_t starBright[NUM_STARS];
@@ -247,6 +267,183 @@ void fetchSunTimes() {
   lastWeatherFetchMs = millis();
 }
 
+// ----- Minimal Protobuf reader (GTFS-realtime is binary protobuf, not JSON) -
+// Only what's needed to walk FeedMessage → FeedEntity → TripUpdate →
+// TripDescriptor.route_id / StopTimeUpdate.stop_id / StopTimeEvent.time.
+static bool pbVarint(PBBuf &b, uint64_t &out) {
+  out = 0;
+  for (int shift = 0; shift <= 63; shift += 7) {
+    if (b.pos >= b.len) return false;
+    uint8_t byte = b.data[b.pos++];
+    out |= (uint64_t)(byte & 0x7F) << shift;
+    if (!(byte & 0x80)) return true;
+  }
+  return false;
+}
+
+static bool pbTag(PBBuf &b, uint32_t &field, uint8_t &wireType) {
+  uint64_t v;
+  if (!pbVarint(b, v)) return false;
+  field    = (uint32_t)(v >> 3);
+  wireType = (uint8_t)(v & 0x07);
+  return true;
+}
+
+// Carves out a length-delimited field as a sub-buffer view (no copy).
+static bool pbBytes(PBBuf &b, PBBuf &out) {
+  uint64_t len;
+  if (!pbVarint(b, len)) return false;
+  if (b.pos + len > b.len) return false;
+  out.data = b.data + b.pos;
+  out.len  = len;
+  out.pos  = 0;
+  b.pos += len;
+  return true;
+}
+
+static bool pbSkip(PBBuf &b, uint8_t wireType) {
+  uint64_t v;
+  PBBuf sub;
+  switch (wireType) {
+    case 0: return pbVarint(b, v);
+    case 1: if (b.pos + 8 > b.len) return false; b.pos += 8; return true;
+    case 2: return pbBytes(b, sub);
+    case 5: if (b.pos + 4 > b.len) return false; b.pos += 4; return true;
+    default: return false;
+  }
+}
+
+static void pbReadString(const PBBuf &b, char *out, size_t outSize) {
+  size_t n = b.len < outSize - 1 ? b.len : outSize - 1;
+  memcpy(out, b.data, n);
+  out[n] = 0;
+}
+
+// Scans one TripUpdate sub-message; if its route matches MTA_ROUTE_ID and it
+// has a stop_time_update for MTA_STOP_ID, folds that arrival time into *best.
+static void scanTripUpdate(PBBuf tu, int64_t *best) {
+  char routeId[8] = "";
+  {
+    PBBuf scan = tu;
+    uint32_t field; uint8_t wt;
+    while (pbTag(scan, field, wt)) {
+      if (field == 1 && wt == 2) {           // trip (TripDescriptor)
+        PBBuf trip;
+        if (!pbBytes(scan, trip)) return;
+        uint32_t f2; uint8_t wt2;
+        while (pbTag(trip, f2, wt2)) {
+          if (f2 == 5 && wt2 == 2) {          // route_id
+            PBBuf rid;
+            if (!pbBytes(trip, rid)) return;
+            pbReadString(rid, routeId, sizeof(routeId));
+          } else if (!pbSkip(trip, wt2)) break;
+        }
+      } else if (!pbSkip(scan, wt)) break;
+    }
+  }
+  if (strcmp(routeId, MTA_ROUTE_ID) != 0) return;
+
+  PBBuf scan = tu;
+  uint32_t field; uint8_t wt;
+  while (pbTag(scan, field, wt)) {
+    if (field == 2 && wt == 2) {              // stop_time_update
+      PBBuf stu;
+      if (!pbBytes(scan, stu)) return;
+      char stopId[8] = "";
+      int64_t arrivalTime = -1;
+      uint32_t f2; uint8_t wt2;
+      while (pbTag(stu, f2, wt2)) {
+        if (f2 == 4 && wt2 == 2) {            // stop_id
+          PBBuf sid;
+          if (!pbBytes(stu, sid)) return;
+          pbReadString(sid, stopId, sizeof(stopId));
+        } else if (f2 == 2 && wt2 == 2) {     // arrival (StopTimeEvent)
+          PBBuf ev;
+          if (!pbBytes(stu, ev)) return;
+          uint32_t f3; uint8_t wt3;
+          while (pbTag(ev, f3, wt3)) {
+            if (f3 == 2 && wt3 == 0) {        // time
+              uint64_t t;
+              if (!pbVarint(ev, t)) return;
+              arrivalTime = (int64_t)t;
+            } else if (!pbSkip(ev, wt3)) break;
+          }
+        } else if (!pbSkip(stu, wt2)) break;
+      }
+      if (arrivalTime > 0 && strcmp(stopId, MTA_STOP_ID) == 0) {
+        if (*best < 0 || arrivalTime < *best) *best = arrivalTime;
+      }
+    } else if (!pbSkip(scan, wt)) break;
+  }
+}
+
+static void parseFeedForNextTrain(const uint8_t *data, size_t len) {
+  PBBuf msg{data, len, 0};
+  int64_t best = -1;
+  uint32_t field; uint8_t wt;
+  while (pbTag(msg, field, wt)) {
+    if (field == 2 && wt == 2) {              // FeedEntity
+      PBBuf entity;
+      if (!pbBytes(msg, entity)) break;
+      uint32_t f2; uint8_t wt2;
+      while (pbTag(entity, f2, wt2)) {
+        if (f2 == 3 && wt2 == 2) {            // trip_update
+          PBBuf tu;
+          if (!pbBytes(entity, tu)) break;
+          scanTripUpdate(tu, &best);
+        } else if (!pbSkip(entity, wt2)) break;
+      }
+    } else if (!pbSkip(msg, wt)) break;
+  }
+  nextTrainEpoch = best;
+}
+
+void fetchNextTrain() {
+  lastTrainFetchMs = millis();
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.begin(MTA_FEED_URL);  // HTTPS only — MTA has no plain-HTTP endpoint
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    int len = http.getSize();
+    if (len > 0 && len < 300000) {
+      uint8_t *buf = (uint8_t *)malloc(len);
+      if (buf) {
+        // A single readBytes() call isn't reliable at this size: it gives up
+        // as soon as any one byte doesn't arrive within its timeout, and a
+        // ~140KB HTTPS transfer over WiFi can easily have gaps longer than
+        // that. Keep asking for whatever's left until it's all here or an
+        // overall deadline passes.
+        WiFiClient *stream = http.getStreamPtr();
+        stream->setTimeout(5000);
+        size_t total = 0;
+        uint32_t deadline = millis() + 20000;
+        while (total < (size_t)len && millis() < deadline) {
+          size_t n = stream->readBytes(buf + total, len - total);
+          if (n > 0) total += n;
+          else delay(1);
+        }
+        int got = (int)total;
+        if (got == len) {
+          parseFeedForNextTrain(buf, len);
+          Serial.printf("Next M (Manhattan-bound) epoch: %lld\n", (long long)nextTrainEpoch);
+        } else {
+          Serial.printf("MTA feed: short read (%d of %d).\n", got, len);
+        }
+        free(buf);
+      } else {
+        Serial.println("MTA feed: malloc failed.");
+      }
+    } else {
+      Serial.printf("MTA feed: unexpected size %d.\n", len);
+    }
+  } else {
+    Serial.printf("MTA feed: HTTP %d.\n", code);
+  }
+  http.end();
+}
+
 bool isDaytime() {
   struct tm t;
   if (!getLocalTime(&t, 0)) return false;
@@ -255,11 +452,17 @@ bool isDaytime() {
 }
 
 uint16_t tempColorF(float f) {
-  if      (f < 32) return matrix.color565(120, 160, 255);  // freezing: blue
-  else if (f < 50) return matrix.color565(120, 220, 255);  // cold: cyan
-  else if (f < 70) return matrix.color565(130, 255, 140);  // mild: green
-  else if (f < 85) return matrix.color565(255, 210,  80);  // warm: yellow
-  else             return matrix.color565(255,  90,  60);  // hot: red
+  if      (f < 50) return matrix.color565( 40,  70, 230);  // deep blue
+  else if (f < 65) return matrix.color565(120, 200, 255);  // light blue
+  else if (f < 75) return matrix.color565(255, 220,  60);  // yellow
+  else if (f < 85) return matrix.color565(255, 140,  30);  // orange
+  else             return matrix.color565(255,  60,  40);  // red
+}
+
+uint16_t trainColorMins(int mins) {
+  if      (mins <= 5) return matrix.color565(255,  60,  40);  // red
+  else if (mins <= 7) return matrix.color565(255, 140,  30);  // orange
+  else                return matrix.color565( 80, 220, 100);  // green
 }
 
 void drawSun(int cx, int cy) {
@@ -375,6 +578,14 @@ void setup() {
           sy = row * cellH + random(cellH);
           tries++;
         } while (sx <= CLOCK_X2 && sy <= CLOCK_Y2 && tries < 10);
+        // Cells fully inside the clock/temp/train block have no valid spot at
+        // all, so the retries above can never escape it — fall back to a
+        // random spot anywhere outside the block instead of leaving the star
+        // sitting on top of the text.
+        while (sx <= CLOCK_X2 && sy <= CLOCK_Y2) {
+          sx = random(WIDTH);
+          sy = random(SKY_MAX_Y + 1);
+        }
         starX[idx]      = sx;
         starY[idx]      = sy;
         starPeak[idx]   = random(100, 256);
@@ -408,6 +619,7 @@ void setup() {
 
   setupWiFiNTP();
   fetchSunTimes();
+  fetchNextTrain();
 }
 
 // -----------------------------------------------------------------------
@@ -429,6 +641,10 @@ void loop() {
   // ── Periodic weather refresh (sun times + temperature) ────────────────
   if (millis() - lastWeatherFetchMs > WEATHER_REFRESH_MS)
     fetchSunTimes();
+
+  // ── Periodic MTA refresh (next M train) ────────────────────────────────
+  if (millis() - lastTrainFetchMs > TRAIN_REFRESH_MS)
+    fetchNextTrain();
 
   // ── Resolve day/night ─────────────────────────────────────────────────
   bool dayMode;
@@ -541,6 +757,23 @@ void loop() {
     matrix.setCursor(3, 12);
     matrix.print(tempBuf);
     matrix.fillRect(matrix.getCursorX(), 12, 2, 2, tempColor);
+  }
+
+  // Minutes to next Manhattan-bound M train, Central Av (below temperature)
+  {
+    char trainBuf[4] = "--";
+    uint16_t trainColor = matrix.color565(140, 200, 255);  // neutral, unknown
+    if (nextTrainEpoch > 0) {
+      long secsLeft = (long)(nextTrainEpoch - time(nullptr));
+      if (secsLeft < 0) secsLeft = 0;
+      int minsLeft = (secsLeft + 59) / 60;  // round up, like a real countdown board
+      if (minsLeft > 99) minsLeft = 99;
+      snprintf(trainBuf, sizeof(trainBuf), "%d", minsLeft);
+      trainColor = trainColorMins(minsLeft);
+    }
+    matrix.setTextColor(trainColor);
+    matrix.setCursor(3, 21);
+    matrix.print(trainBuf);
   }
 
   // Mode label (A / D / N) shown for 3 s after button press
