@@ -73,8 +73,11 @@ uint32_t lastWeatherFetchMs = 0;
 #define MTA_STOP_ID  "M10N"
 #define MTA_ROUTE_ID "M"
 #define TRAIN_REFRESH_MS (60UL * 1000UL)  // 1 minute — MTA feed is HTTPS-only, see fetchNextTrain()
-int64_t  nextTrainEpoch  = -1;  // unix time of next arrival, -1 = unknown
-uint32_t lastTrainFetchMs = 0;
+#define TRAIN_STALE_SECS  180  // if the last known arrival is this far past, treat it as unknown
+#define TRAIN_FAIL_LIMIT  5    // consecutive fetch failures before forcing a WiFi reconnect
+int64_t  nextTrainEpoch     = -1;  // unix time of next arrival, -1 = unknown
+uint32_t lastTrainFetchMs   = 0;
+uint8_t  trainFetchFailStreak = 0;
 
 #define HEIGHT   64
 #define WIDTH    64
@@ -411,6 +414,7 @@ static void parseFeedForNextTrain(const uint8_t *data, size_t len) {
 void fetchNextTrain() {
   lastTrainFetchMs = millis();
   if (WiFi.status() != WL_CONNECTED) return;
+  bool ok = false;
   HTTPClient http;
   http.setTimeout(8000);
   http.begin(MTA_FEED_URL);  // HTTPS only — MTA has no plain-HTTP endpoint
@@ -438,6 +442,7 @@ void fetchNextTrain() {
         if (got == len) {
           parseFeedForNextTrain(buf, len);
           Serial.printf("Next M (Manhattan-bound) epoch: %lld\n", (long long)nextTrainEpoch);
+          ok = true;
         } else {
           Serial.printf("MTA feed: short read (%d of %d).\n", got, len);
         }
@@ -452,6 +457,22 @@ void fetchNextTrain() {
     Serial.printf("MTA feed: HTTP %d.\n", code);
   }
   http.end();
+
+  // This fetch runs every minute and does a full TLS handshake plus a large
+  // allocation each time — over many hours that's enough churn to eventually
+  // wedge the WiFi/TLS stack into a state where every request just fails.
+  // A handful of one-off failures is normal network noise; several minutes
+  // straight of them means the connection is stuck, so reset it rather than
+  // silently failing forever until someone power-cycles the board.
+  if (ok) {
+    trainFetchFailStreak = 0;
+  } else if (++trainFetchFailStreak >= TRAIN_FAIL_LIMIT) {
+    Serial.println("MTA feed: too many consecutive failures — reconnecting WiFi.");
+    WiFi.disconnect();
+    delay(100);
+    WiFi.reconnect();
+    trainFetchFailStreak = 0;
+  }
 }
 
 #define TWILIGHT_MINS 30  // dawn/dusk window length, each side of sunrise/sunset
@@ -811,8 +832,11 @@ void loop() {
   {
     char trainBuf[4] = "--";
     uint16_t trainColor = matrix.color565(140, 200, 255);  // neutral, unknown
-    if (nextTrainEpoch > 0) {
-      long secsLeft = (long)(nextTrainEpoch - time(nullptr));
+    long secsLeft = (long)(nextTrainEpoch - time(nullptr));
+    // If the last known arrival is well in the past, the feed hasn't
+    // refreshed in a while (fetch failures) — show unknown rather than
+    // parking on a stale "0" forever.
+    if (nextTrainEpoch > 0 && secsLeft > -TRAIN_STALE_SECS) {
       if (secsLeft < 0) secsLeft = 0;
       int minsLeft = (secsLeft + 59) / 60;  // round up, like a real countdown board
       if (minsLeft > 99) minsLeft = 99;
